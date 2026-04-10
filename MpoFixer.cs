@@ -12,7 +12,7 @@ internal static class MpoFixer
 {
     /// <summary>
     /// Checks if MPO is on the wrong display and triggers NVAPI reconfiguration if needed.
-    /// Returns true if MPO ended up on the primary display (either already was or was fixed).
+    /// Returns true if MPO ended up on the primary display (verified post-fix).
     /// </summary>
     internal static bool Fix(bool dryRun = false, bool force = false)
     {
@@ -49,7 +49,20 @@ internal static class MpoFixer
             DisplayApi.SetDisplayConfig(pathInfos, flags);
 
             Console.WriteLine("Display config reapplied with FORCE flags.");
-            return true;
+
+            // Verify MPO actually moved
+            Thread.Sleep(1500);
+            var state = MpoDetector.GetMpoState();
+            if (state == MpoState.OnPrimary)
+            {
+                Console.WriteLine("Verified: MPO is now on primary display.");
+                return true;
+            }
+            else
+            {
+                Console.Error.WriteLine($"WARNING: Post-fix verification returned {state}.");
+                return false;
+            }
         }
         catch (Exception ex)
         {

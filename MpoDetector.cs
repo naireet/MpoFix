@@ -4,6 +4,11 @@ using MpoFix.Interop;
 namespace MpoFix;
 
 /// <summary>
+/// Tri-state result for MPO detection — distinguishes "unknown" from "mismatch".
+/// </summary>
+internal enum MpoState { OnPrimary, OffPrimary, Unknown }
+
+/// <summary>
 /// Queries per-display MPO plane assignment using D3DKMT kernel thunks (same API as Special K).
 /// </summary>
 internal static class MpoDetector
@@ -18,16 +23,22 @@ internal static class MpoDetector
         bool IsPrimary);
 
     /// <summary>
-    /// Queries MPO capabilities for all active displays.
+    /// Queries MPO capabilities for all active displays via EnumDisplayDevices enumeration.
     /// </summary>
-    internal static List<DisplayMpoInfo> QueryAllDisplays(int maxDisplays = 8)
+    internal static List<DisplayMpoInfo> QueryAllDisplays()
     {
         var results = new List<DisplayMpoInfo>();
 
-        for (int i = 1; i <= maxDisplays; i++)
+        var dd = new DISPLAY_DEVICE();
+        dd.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
+
+        for (uint i = 0; EnumDisplayDevicesW(null, i, ref dd, 0); i++)
         {
-            string name = $"\\\\.\\DISPLAY{i}";
-            var info = QueryDisplay(name);
+            // Skip inactive/mirroring devices
+            if ((dd.StateFlags & 0x1) == 0) // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
+                continue;
+
+            var info = QueryDisplay(dd.DeviceName);
             if (info is not null)
                 results.Add(info);
         }
@@ -82,11 +93,20 @@ internal static class MpoDetector
     /// <summary>
     /// Returns true if MPO is currently assigned to the primary display.
     /// </summary>
-    internal static bool IsMpoOnPrimary()
+    internal static bool IsMpoOnPrimary() => GetMpoState() == MpoState.OnPrimary;
+
+    /// <summary>
+    /// Tri-state MPO detection: OnPrimary, OffPrimary, or Unknown (detection failed/no displays).
+    /// </summary>
+    internal static MpoState GetMpoState()
     {
         var displays = QueryAllDisplays();
+        if (displays.Count == 0) return MpoState.Unknown;
+
         var primary = displays.FirstOrDefault(d => d.IsPrimary);
-        return primary?.HasMpo ?? false;
+        if (primary is null) return MpoState.Unknown;
+
+        return primary.HasMpo ? MpoState.OnPrimary : MpoState.OffPrimary;
     }
 
     /// <summary>
@@ -133,6 +153,7 @@ internal static class MpoDetector
 
     /// <summary>
     /// Gets monitor friendly name and primary status via EnumDisplayDevices.
+    /// Matches by DeviceName string instead of index arithmetic.
     /// Falls back to CCD API for actual EDID monitor name.
     /// </summary>
     private static (string monitorName, bool isPrimary) GetMonitorInfo(string gdiDisplayName)
@@ -140,15 +161,16 @@ internal static class MpoDetector
         bool isPrimary = false;
         string monitorName = "Unknown";
 
-        // Get primary status from adapter flags
+        // Enumerate adapters and match by DeviceName
         var ddAdapter = new DISPLAY_DEVICE();
         ddAdapter.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
 
-        if (int.TryParse(gdiDisplayName.Replace("\\\\.\\DISPLAY", ""), out int idx))
+        for (uint i = 0; EnumDisplayDevicesW(null, i, ref ddAdapter, 0); i++)
         {
-            if (EnumDisplayDevicesW(null, (uint)(idx - 1), ref ddAdapter, 0))
+            if (ddAdapter.DeviceName.Equals(gdiDisplayName, StringComparison.OrdinalIgnoreCase))
             {
                 isPrimary = (ddAdapter.StateFlags & 0x4) != 0; // DISPLAY_DEVICE_PRIMARY_DEVICE
+                break;
             }
         }
 
@@ -160,43 +182,62 @@ internal static class MpoDetector
 
     /// <summary>
     /// Uses Windows CCD (QueryDisplayConfig + DisplayConfigGetDeviceInfo) to get EDID monitor name.
+    /// Retries on ERROR_INSUFFICIENT_BUFFER which can occur during topology churn.
     /// </summary>
     private static string? GetEdidMonitorName(string gdiDisplayName)
     {
-        // Get all display paths
-        uint pathCount = 0, modeCount = 0;
-        int err = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, ref pathCount, ref modeCount);
-        if (err != 0) return null;
+        const int ERROR_INSUFFICIENT_BUFFER = 122;
+        const int maxRetries = 3;
 
-        var paths = new DISPLAYCONFIG_PATH_INFO[pathCount];
-        var modes = new DISPLAYCONFIG_MODE_INFO[modeCount];
-        err = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
-        if (err != 0) return null;
+        DISPLAYCONFIG_PATH_INFO[] paths;
+        DISPLAYCONFIG_MODE_INFO[] modes;
+        uint pathCount, modeCount;
 
-        // Find the path for our GDI display name
-        for (int i = 0; i < pathCount; i++)
+        // Retry loop handles buffer race during display reconfiguration
+        for (int attempt = 0; attempt < maxRetries; attempt++)
         {
-            var sourceName = new DISPLAYCONFIG_SOURCE_DEVICE_NAME();
-            sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            sourceName.header.size = (uint)Marshal.SizeOf<DISPLAYCONFIG_SOURCE_DEVICE_NAME>();
-            sourceName.header.adapterId = paths[i].sourceInfo.adapterId;
-            sourceName.header.id = paths[i].sourceInfo.id;
+            pathCount = 0; modeCount = 0;
+            int err = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, ref pathCount, ref modeCount);
+            if (err != 0) return null;
 
-            if (DisplayConfigGetDeviceInfo(ref sourceName) != 0)
-                continue;
+            paths = new DISPLAYCONFIG_PATH_INFO[pathCount];
+            modes = new DISPLAYCONFIG_MODE_INFO[modeCount];
+            err = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
 
-            if (!sourceName.viewGdiDeviceName.Equals(gdiDisplayName, StringComparison.OrdinalIgnoreCase))
-                continue;
+            if (err == 0)
+            {
+                // Success — search for our display
+                for (int i = 0; i < pathCount; i++)
+                {
+                    var sourceName = new DISPLAYCONFIG_SOURCE_DEVICE_NAME();
+                    sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                    sourceName.header.size = (uint)Marshal.SizeOf<DISPLAYCONFIG_SOURCE_DEVICE_NAME>();
+                    sourceName.header.adapterId = paths[i].sourceInfo.adapterId;
+                    sourceName.header.id = paths[i].sourceInfo.id;
 
-            // Found the path — now get the target (monitor) name
-            var targetName = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
-            targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-            targetName.header.size = (uint)Marshal.SizeOf<DISPLAYCONFIG_TARGET_DEVICE_NAME>();
-            targetName.header.adapterId = paths[i].targetInfo.adapterId;
-            targetName.header.id = paths[i].targetInfo.id;
+                    if (DisplayConfigGetDeviceInfo(ref sourceName) != 0)
+                        continue;
 
-            if (DisplayConfigGetDeviceInfo(ref targetName) == 0)
-                return targetName.monitorFriendlyDeviceName;
+                    if (!sourceName.viewGdiDeviceName.Equals(gdiDisplayName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var targetName = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
+                    targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+                    targetName.header.size = (uint)Marshal.SizeOf<DISPLAYCONFIG_TARGET_DEVICE_NAME>();
+                    targetName.header.adapterId = paths[i].targetInfo.adapterId;
+                    targetName.header.id = paths[i].targetInfo.id;
+
+                    if (DisplayConfigGetDeviceInfo(ref targetName) == 0)
+                        return targetName.monitorFriendlyDeviceName;
+                }
+
+                return null; // Display not found in paths
+            }
+
+            if (err != ERROR_INSUFFICIENT_BUFFER)
+                return null; // Non-retryable error
+
+            Thread.Sleep(50); // Brief pause before retry
         }
 
         return null;
