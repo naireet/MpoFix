@@ -34,10 +34,10 @@ mpofix fix --dry-run   # Show what would happen without making changes
 ### Example Output
 
 ```
-Display        Monitor              RGB   YUV   Primary   MPO
---------------------------------------------------------------------
-\\.\DISPLAY1   27GL850              6     6               YES
-\\.\DISPLAY2   LG ULTRAGEAR+        1     1     YES       no
+Display        Monitor              Planes RGB   YUV   Primary   MPO
+----------------------------------------------------------------------------
+\\.\DISPLAY1   27GL850              6      5     5               YES
+\\.\DISPLAY2   LG ULTRAGEAR+        1      5     5     YES       no
 
 MISMATCH: MPO on 27GL850, but primary is LG ULTRAGEAR+
 Run 'mpofix fix' to reassign.
@@ -45,10 +45,10 @@ Run 'mpofix fix' to reassign.
 
 After fix:
 ```
-Display        Monitor              RGB   YUV   Primary   MPO
---------------------------------------------------------------------
-\\.\DISPLAY1   27GL850              1     1               no
-\\.\DISPLAY2   LG ULTRAGEAR+        3     3     YES       YES
+Display        Monitor              Planes RGB   YUV   Primary   MPO
+----------------------------------------------------------------------------
+\\.\DISPLAY1   27GL850              1      5     5               no
+\\.\DISPLAY2   LG ULTRAGEAR+        6      5     5     YES       YES
 
 OK: MPO active on primary display (LG ULTRAGEAR+)
 ```
@@ -78,8 +78,10 @@ dotnet run -- status
 Uses Windows D3DKMT (Direct3D Kernel Mode Thunk) functions from `gdi32.dll`:
 
 - `D3DKMTOpenAdapterFromGdiDisplayName` — opens adapter handle per display
-- `D3DKMTGetMultiPlaneOverlayCaps` — queries `MaxRGBPlanes` per VidPnSource
-- Display with `MaxRGBPlanes > 1` has MPO active
+- `D3DKMTGetMultiPlaneOverlayCaps` — queries `MaxPlanes` per VidPnSource
+- Display with `MaxPlanes > 1` has MPO active (the plane count Special K reads).
+  Note: `MaxRGBPlanes` is **not** used — recent NVIDIA drivers pin it at a fixed
+  capability ceiling on every display, so it no longer indicates the active display.
 
 Monitor names are resolved via Windows CCD API (`QueryDisplayConfig` + `DisplayConfigGetDeviceInfo`) for actual EDID names instead of "Generic PnP Monitor".
 
