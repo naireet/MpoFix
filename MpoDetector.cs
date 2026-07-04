@@ -17,6 +17,7 @@ internal static class MpoDetector
         string DeviceName,
         string MonitorName,
         uint VidPnSourceId,
+        uint MaxPlanes,
         uint MaxRGBPlanes,
         uint MaxYUVPlanes,
         bool HasMpo,
@@ -78,9 +79,18 @@ internal static class MpoDetector
                 DeviceName: gdiDisplayName,
                 MonitorName: monitorName,
                 VidPnSourceId: openAdapter.VidPnSourceId,
+                MaxPlanes: caps.MaxPlanes,
                 MaxRGBPlanes: caps.MaxRGBPlanes,
                 MaxYUVPlanes: caps.MaxYUVPlanes,
-                HasMpo: caps.MaxRGBPlanes > 1,
+                // MPO/Independent-Flip active is discriminated by MaxPlanes > 1 — the count of
+                // planes the display can simultaneously flip. This is exactly what Special K reads
+                // for its "Planes" column. We used to key off MaxRGBPlanes > 1, but NVIDIA driver
+                // 32.0.16.1062 decoupled MaxRGBPlanes from MaxPlanes: it now pins MaxRGBPlanes at a
+                // capability ceiling (5) on ALL displays, so RGB > 1 became true everywhere and made
+                // the primary falsely register as the MPO holder. MaxPlanes still tracks the real
+                // assignment (e.g. 6 on the active display vs 1 on the idle one), corroborated by
+                // OverlayCaps (0xBF0 vs 0xB00) and MaxStretchFactor (10.0 vs 1.0).
+                HasMpo: caps.MaxPlanes > 1,
                 IsPrimary: isPrimary);
         }
         finally
@@ -96,17 +106,38 @@ internal static class MpoDetector
     internal static bool IsMpoOnPrimary() => GetMpoState() == MpoState.OnPrimary;
 
     /// <summary>
-    /// Tri-state MPO detection: OnPrimary, OffPrimary, or Unknown (detection failed/no displays).
+    /// Identifies the single display that currently holds the MPO/Independent-Flip assignment.
+    /// The holder is the display with the most planes (MaxPlanes), and only counts if that
+    /// maximum is &gt; 1 (i.e. MPO is actually active somewhere). Returns null when no display
+    /// has MPO — this keeps GetMpoState() and PrintStatus() in agreement, since both derive
+    /// the holder from this one method instead of each scanning the list independently.
+    /// </summary>
+    internal static DisplayMpoInfo? GetMpoHolder(IReadOnlyList<DisplayMpoInfo> displays)
+    {
+        DisplayMpoInfo? holder = null;
+        foreach (var d in displays)
+        {
+            if (d.MaxPlanes <= 1) continue;
+            if (holder is null || d.MaxPlanes > holder.MaxPlanes)
+                holder = d;
+        }
+        return holder;
+    }
+
+    /// <summary>
+    /// Tri-state MPO detection: OnPrimary, OffPrimary, or Unknown (detection failed / no MPO holder).
     /// </summary>
     internal static MpoState GetMpoState()
     {
         var displays = QueryAllDisplays();
         if (displays.Count == 0) return MpoState.Unknown;
 
-        var primary = displays.FirstOrDefault(d => d.IsPrimary);
-        if (primary is null) return MpoState.Unknown;
+        var holder = GetMpoHolder(displays);
+        // No display holds MPO — either transient (displays not ready) or genuinely idle.
+        // Report Unknown rather than a false OnPrimary so callers stay cautious.
+        if (holder is null) return MpoState.Unknown;
 
-        return primary.HasMpo ? MpoState.OnPrimary : MpoState.OffPrimary;
+        return holder.IsPrimary ? MpoState.OnPrimary : MpoState.OffPrimary;
     }
 
     /// <summary>
@@ -122,17 +153,17 @@ internal static class MpoDetector
             return;
         }
 
-        Console.WriteLine($"{"Display",-14} {"Monitor",-20} {"RGB",-5} {"YUV",-5} {"Primary",-9} MPO");
-        Console.WriteLine(new string('-', 68));
+        Console.WriteLine($"{"Display",-14} {"Monitor",-20} {"Planes",-7} {"RGB",-5} {"YUV",-5} {"Primary",-9} MPO");
+        Console.WriteLine(new string('-', 76));
 
         foreach (var d in displays)
         {
             string mpoStatus = d.HasMpo ? "YES" : "no";
             string primary = d.IsPrimary ? "YES" : "";
-            Console.WriteLine($"{d.DeviceName,-14} {d.MonitorName,-20} {d.MaxRGBPlanes,-5} {d.MaxYUVPlanes,-5} {primary,-9} {mpoStatus}");
+            Console.WriteLine($"{d.DeviceName,-14} {d.MonitorName,-20} {d.MaxPlanes,-7} {d.MaxRGBPlanes,-5} {d.MaxYUVPlanes,-5} {primary,-9} {mpoStatus}");
         }
 
-        var mpoDisplay = displays.FirstOrDefault(d => d.HasMpo);
+        var mpoDisplay = GetMpoHolder(displays);
         var primaryDisplay = displays.FirstOrDefault(d => d.IsPrimary);
         Console.WriteLine();
 
