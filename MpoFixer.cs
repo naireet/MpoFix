@@ -1,77 +1,109 @@
 using NvAPIWrapper.Native;
 using NvAPIWrapper.Native.Display;
+using MpoFix.Interop;
 
 namespace MpoFix;
 
-/// <summary>
-/// Forces NVIDIA driver display path reconfiguration via NVAPI,
-/// which triggers MPO plane reassignment to the primary display.
-/// Same mechanism as toggling primary in NVIDIA App.
-/// </summary>
-internal static class MpoFixer
+internal interface INvidiaConfiguration
 {
-    /// <summary>
-    /// Checks if MPO is on the wrong display and triggers NVAPI reconfiguration if needed.
-    /// Returns true if MPO ended up on the primary display (verified post-fix).
-    /// </summary>
-    internal static bool Fix(bool dryRun = false, bool force = false)
+    int PathCount { get; }
+    void Reapply(DisplayConfigFlags flags);
+}
+
+internal interface INvidiaDisplayApi
+{
+    void Initialize();
+    INvidiaConfiguration GetCurrentConfig();
+    void Unload();
+}
+
+internal sealed class NvidiaDisplayApi : INvidiaDisplayApi
+{
+    public void Initialize() => GeneralApi.Initialize();
+    public INvidiaConfiguration GetCurrentConfig()
     {
-        if (!force && MpoDetector.IsMpoOnPrimary())
+        var paths = DisplayApi.GetDisplayConfig();
+        return new Configuration(paths.Length, flags => DisplayApi.SetDisplayConfig(paths, flags));
+    }
+    public void Unload() => GeneralApi.Unload();
+    private sealed class Configuration(int count, Action<DisplayConfigFlags> apply) : INvidiaConfiguration
+    {
+        public int PathCount => count;
+        public void Reapply(DisplayConfigFlags flags) => apply(flags);
+    }
+}
+
+internal sealed class LegacyMpoRepair(INvidiaDisplayApi nvidia, Func<MpoState> detect,
+    ITopologyDiagnostics topology, IObservationClock clock, IDiagnosticSink log)
+{
+    internal bool Fix(bool dryRun = false, bool force = false)
+    {
+        if (!force && detect() == MpoState.OnPrimary)
         {
-            Console.WriteLine("MPO is already on the primary display. No fix needed.");
+            log.Write("nvapi.skip", "MPO already on primary; no repair needed.");
             return true;
         }
-
+        bool success = false;
+        string stage = "initialize";
         try
         {
-            GeneralApi.Initialize();
-
-            var pathInfos = DisplayApi.GetDisplayConfig();
-
-            if (pathInfos.Length == 0)
+            log.Write("nvapi.initialize", "Starting legacy current-config repair");
+            nvidia.Initialize();
+            stage = "get";
+            var config = nvidia.GetCurrentConfig();
+            log.Write("nvapi.get", $"pathCount={config.PathCount}");
+            if (config.PathCount == 0)
+                log.Write("nvapi.error", "No display paths returned");
+            else if (dryRun)
             {
-                Console.Error.WriteLine("ERROR: No display paths returned from NVAPI.");
-                return false;
-            }
-
-            Console.WriteLine($"Found {pathInfos.Length} display path(s).");
-
-            if (dryRun)
-            {
-                Console.WriteLine("Dry run — would reapply config with FORCE flags.");
-                return true;
-            }
-
-            // Reapply the SAME config with force flags — triggers driver reconfiguration
-            var flags = DisplayConfigFlags.DriverReloadAllowed
-                      | DisplayConfigFlags.ForceModeEnumeration;
-
-            DisplayApi.SetDisplayConfig(pathInfos, flags);
-
-            Console.WriteLine("Display config reapplied with FORCE flags.");
-
-            // Verify MPO actually moved
-            Thread.Sleep(1500);
-            var state = MpoDetector.GetMpoState();
-            if (state == MpoState.OnPrimary)
-            {
-                Console.WriteLine("Verified: MPO is now on primary display.");
-                return true;
+                log.Write("nvapi.dry-run", "Would reapply current config with legacy FORCE flags");
+                success = true;
             }
             else
             {
-                Console.Error.WriteLine($"WARNING: Post-fix verification returned {state}.");
-                return false;
+                stage = "before-topology";
+                var before = topology.Collect();
+                log.Write("nvapi.before", $"topology={before.Status}, pathCount={before.Paths.Count}, error={before.NativeError}");
+                stage = "set";
+                var flags = DisplayConfigFlags.DriverReloadAllowed | DisplayConfigFlags.ForceModeEnumeration;
+                log.Write("nvapi.set", $"pathCount={config.PathCount}, flags={flags}");
+                config.Reapply(flags);
+                stage = "verification";
+                clock.Wait(TimeSpan.FromMilliseconds(1500));
+                var after = topology.Collect();
+                log.Write("nvapi.after", $"topology={after.Status}, pathCount={after.Paths.Count}, error={after.NativeError}");
+                var state = detect();
+                log.Write("nvapi.verification", $"state={state}");
+                success = state == MpoState.OnPrimary;
             }
         }
+        catch (DiagnosticException) { throw; }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"NVAPI error: {ex.Message}");
-            return false;
+            log.Write($"nvapi.{stage}.exception", Diagnostics.ExceptionDetail(ex));
         }
         finally
         {
-            try { GeneralApi.Unload(); } catch { }
+            try
+            {
+                nvidia.Unload();
+                log.Write("nvapi.unload", "Completed");
+            }
+            catch (DiagnosticException) { throw; }
+            catch (Exception ex)
+            {
+                log.Write("nvapi.unload.exception", Diagnostics.ExceptionDetail(ex));
+                success = false;
+            }
         }
+        return success;
     }
+}
+
+internal static class MpoFixer
+{
+    internal static bool Fix(bool dryRun = false, bool force = false) =>
+        new LegacyMpoRepair(new NvidiaDisplayApi(), MpoDetector.GetMpoState,
+            new TopologyCollector(new Win32CcdNative(), Diagnostics.Sink, new SystemObservationClock()),
+            new SystemObservationClock(), Diagnostics.Sink).Fix(dryRun, force);
 }

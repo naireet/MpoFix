@@ -1,396 +1,139 @@
-using System.Runtime.InteropServices;
 using MpoFix.Interop;
 
 namespace MpoFix;
 
-/// <summary>
-/// Tri-state result for MPO detection — distinguishes "unknown" from "mismatch".
-/// </summary>
 internal enum MpoState { OnPrimary, OffPrimary, Unknown }
+internal enum MpoReason { ConfirmedHolder, NoSuccessfulQuery, NoActiveHolder, IncompleteEvidence, AmbiguousHolder }
 
-/// <summary>
-/// Queries per-display MPO plane assignment using D3DKMT kernel thunks (same API as Special K).
-/// </summary>
-internal static class MpoDetector
+internal sealed record DisplayMpoInfo(string DeviceName, string MonitorName, uint VidPnSourceId,
+    uint MaxPlanes, uint MaxRGBPlanes, uint MaxYUVPlanes, bool IsPrimary,
+    uint? OpenStatus, uint? CapsStatus, uint? CloseStatus, string? Failure)
 {
-    internal record DisplayMpoInfo(
-        string DeviceName,
-        string MonitorName,
-        uint VidPnSourceId,
-        uint MaxPlanes,
-        uint MaxRGBPlanes,
-        uint MaxYUVPlanes,
-        bool HasMpo,
-        bool IsPrimary);
+    internal bool HasMpo => CapsStatus == 0 && MaxPlanes > 1;
+    internal bool QuerySucceeded => OpenStatus == 0 && CapsStatus == 0;
+    internal string DetectionReason => Failure ?? (CloseStatus != 0 ? "Adapter close failed" :
+        MaxPlanes > 1 ? "MaxPlanes > 1 holder candidate" : "No MaxPlanes > 1 (possibly idle)");
+}
 
-    /// <summary>
-    /// Queries MPO capabilities for all active displays via EnumDisplayDevices enumeration.
-    /// </summary>
-    internal static List<DisplayMpoInfo> QueryAllDisplays()
+internal sealed record MpoObservation(MpoState State, MpoReason Reason, IReadOnlyList<DisplayMpoInfo> Displays);
+
+internal sealed class MpoQuery(IMpoNative native, ITopologyDiagnostics topology, IDiagnosticSink log)
+{
+    internal MpoObservation Observe(TopologyResult? topologyObservation = null)
     {
         var results = new List<DisplayMpoInfo>();
-
-        var dd = new DISPLAY_DEVICE();
-        dd.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
-
-        for (uint i = 0; EnumDisplayDevicesW(null, i, ref dd, 0); i++)
-        {
-            // Skip inactive/mirroring devices
-            if ((dd.StateFlags & 0x1) == 0) // DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
-                continue;
-
-            var info = QueryDisplay(dd.DeviceName);
-            if (info is not null)
-                results.Add(info);
-        }
-
-        return results;
-    }
-
-    /// <summary>
-    /// Queries MPO capabilities for a single display by GDI name.
-    /// </summary>
-    internal static DisplayMpoInfo? QueryDisplay(string gdiDisplayName)
-    {
-        var openAdapter = new D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME
-        {
-            DeviceName = gdiDisplayName
-        };
-
-        uint hr = D3DKMT.D3DKMTOpenAdapterFromGdiDisplayName(ref openAdapter);
-        if (!D3DKMT.Succeeded(hr))
-            return null;
-
         try
         {
-            var caps = new D3DKMT_GET_MULTIPLANE_OVERLAY_CAPS
+            var enumeration = native.Enumerate();
+            log.Write("mpo.enumeration", $"complete={enumeration.Complete}, error={enumeration.Error}, count={enumeration.Displays.Count}");
+            var names = topologyObservation ?? topology.Collect();
+            foreach (var display in enumeration.Displays)
             {
-                hAdapter = openAdapter.hAdapter,
-                VidPnSourceId = openAdapter.VidPnSourceId
-            };
-
-            hr = D3DKMT.D3DKMTGetMultiPlaneOverlayCaps(ref caps);
-            if (!D3DKMT.Succeeded(hr))
-                return null;
-
-            var (monitorName, isPrimary) = GetMonitorInfo(gdiDisplayName);
-
-            return new DisplayMpoInfo(
-                DeviceName: gdiDisplayName,
-                MonitorName: monitorName,
-                VidPnSourceId: openAdapter.VidPnSourceId,
-                MaxPlanes: caps.MaxPlanes,
-                MaxRGBPlanes: caps.MaxRGBPlanes,
-                MaxYUVPlanes: caps.MaxYUVPlanes,
-                // MPO/Independent-Flip active is discriminated by MaxPlanes > 1 — the count of
-                // planes the display can simultaneously flip. This is exactly what Special K reads
-                // for its "Planes" column. We used to key off MaxRGBPlanes > 1, but NVIDIA driver
-                // 32.0.16.1062 decoupled MaxRGBPlanes from MaxPlanes: it now pins MaxRGBPlanes at a
-                // capability ceiling (5) on ALL displays, so RGB > 1 became true everywhere and made
-                // the primary falsely register as the MPO holder. MaxPlanes still tracks the real
-                // assignment (e.g. 6 on the active display vs 1 on the idle one), corroborated by
-                // OverlayCaps (0xBF0 vs 0xB00) and MaxStretchFactor (10.0 vs 1.0).
-                HasMpo: caps.MaxPlanes > 1,
-                IsPrimary: isPrimary);
+                uint? openStatus = null, capsStatus = null, closeStatus = null;
+                string? failure = null;
+                var open = new D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME { DeviceName = display.Name };
+                var caps = new D3DKMT_GET_MULTIPLANE_OVERLAY_CAPS();
+                try
+                {
+                    openStatus = native.Open(ref open);
+                    log.Write("mpo.open", $"{display.Name}: NTSTATUS=0x{openStatus:X8}");
+                    if (openStatus == 0)
+                    {
+                        caps.hAdapter = open.hAdapter;
+                        caps.VidPnSourceId = open.VidPnSourceId;
+                        capsStatus = native.Caps(ref caps);
+                        log.Write("mpo.caps", $"{display.Name}: NTSTATUS=0x{capsStatus:X8}, source={caps.VidPnSourceId}, planes={caps.MaxPlanes}, RGB={caps.MaxRGBPlanes}, YUV={caps.MaxYUVPlanes}");
+                    }
+                    failure = openStatus != 0 ? "Adapter open failed" : capsStatus != 0 ? "MPO caps query failed" : null;
+                }
+                catch (DiagnosticException) { throw; }
+                catch (Exception ex)
+                {
+                    failure = Diagnostics.ExceptionDetail(ex);
+                    log.Write("mpo.exception", $"{display.Name}: {failure}");
+                }
+                finally
+                {
+                    if (openStatus == 0)
+                    {
+                        try
+                        {
+                            var close = new D3DKMT_CLOSEADAPTER { hAdapter = open.hAdapter };
+                            closeStatus = native.Close(ref close);
+                            log.Write("mpo.close", $"{display.Name}: NTSTATUS=0x{closeStatus:X8}");
+                        }
+                        catch (DiagnosticException) { throw; }
+                        catch (Exception ex)
+                        {
+                            failure = Diagnostics.ExceptionDetail(ex);
+                            log.Write("mpo.close.exception", $"{display.Name}: {failure}");
+                        }
+                    }
+                }
+                string monitorName = names.Paths.FirstOrDefault(p =>
+                    string.Equals(p.GdiName, display.Name, StringComparison.OrdinalIgnoreCase))?.FriendlyName ?? "Unknown";
+                var info = new DisplayMpoInfo(display.Name, monitorName, open.VidPnSourceId, caps.MaxPlanes, caps.MaxRGBPlanes,
+                    caps.MaxYUVPlanes, display.IsPrimary, openStatus, capsStatus, closeStatus, failure);
+                results.Add(info);
+                log.Write("mpo.display", $"{display.Name}, monitor={monitorName}, primary={display.IsPrimary}, reason={info.DetectionReason}");
+            }
+            return Classify(results, enumeration.Complete);
         }
-        finally
+        catch (DiagnosticException) { throw; }
+        catch (Exception ex)
         {
-            var closeAdapter = new D3DKMT_CLOSEADAPTER { hAdapter = openAdapter.hAdapter };
-            D3DKMT.D3DKMTCloseAdapter(ref closeAdapter);
+            log.Write("mpo.enumeration.exception", Diagnostics.ExceptionDetail(ex));
+            return Classify(results, false);
         }
     }
 
-    /// <summary>
-    /// Returns true if MPO is currently assigned to the primary display.
-    /// </summary>
-    internal static bool IsMpoOnPrimary() => GetMpoState() == MpoState.OnPrimary;
-
-    /// <summary>
-    /// Identifies the single display that currently holds the MPO/Independent-Flip assignment.
-    /// The holder is the display with the most planes (MaxPlanes), and only counts if that
-    /// maximum is &gt; 1 (i.e. MPO is actually active somewhere). Returns null when no display
-    /// has MPO — this keeps GetMpoState() and PrintStatus() in agreement, since both derive
-    /// the holder from this one method instead of each scanning the list independently.
-    /// </summary>
-    internal static DisplayMpoInfo? GetMpoHolder(IReadOnlyList<DisplayMpoInfo> displays)
+    private MpoObservation Classify(List<DisplayMpoInfo> displays, bool complete)
     {
-        DisplayMpoInfo? holder = null;
-        foreach (var d in displays)
-        {
-            if (d.MaxPlanes <= 1) continue;
-            if (holder is null || d.MaxPlanes > holder.MaxPlanes)
-                holder = d;
-        }
-        return holder;
-    }
-
-    /// <summary>
-    /// Tri-state MPO detection: OnPrimary, OffPrimary, or Unknown (detection failed / no MPO holder).
-    /// </summary>
-    internal static MpoState GetMpoState()
-    {
-        var displays = QueryAllDisplays();
-        if (displays.Count == 0) return MpoState.Unknown;
-
-        var holder = GetMpoHolder(displays);
-        // No display holds MPO — either transient (displays not ready) or genuinely idle.
-        // Report Unknown rather than a false OnPrimary so callers stay cautious.
-        if (holder is null) return MpoState.Unknown;
-
-        return holder.IsPrimary ? MpoState.OnPrimary : MpoState.OffPrimary;
-    }
-
-    /// <summary>
-    /// Prints MPO status for all displays to the console.
-    /// </summary>
-    internal static void PrintStatus()
-    {
-        var displays = QueryAllDisplays();
-
-        if (displays.Count == 0)
-        {
-            Console.Error.WriteLine("No displays found.");
-            return;
-        }
-
-        Console.WriteLine($"{"Display",-14} {"Monitor",-20} {"Planes",-7} {"RGB",-5} {"YUV",-5} {"Primary",-9} MPO");
-        Console.WriteLine(new string('-', 76));
-
-        foreach (var d in displays)
-        {
-            string mpoStatus = d.HasMpo ? "YES" : "no";
-            string primary = d.IsPrimary ? "YES" : "";
-            Console.WriteLine($"{d.DeviceName,-14} {d.MonitorName,-20} {d.MaxPlanes,-7} {d.MaxRGBPlanes,-5} {d.MaxYUVPlanes,-5} {primary,-9} {mpoStatus}");
-        }
-
-        var mpoDisplay = GetMpoHolder(displays);
-        var primaryDisplay = displays.FirstOrDefault(d => d.IsPrimary);
-        Console.WriteLine();
-
-        if (mpoDisplay is null)
-        {
-            Console.WriteLine("WARNING: No display has MPO planes assigned.");
-        }
-        else if (mpoDisplay.IsPrimary)
-        {
-            Console.WriteLine($"OK: MPO active on primary display ({mpoDisplay.MonitorName})");
-        }
+        MpoReason reason;
+        MpoState state = MpoState.Unknown;
+        var queried = displays.Where(d => d.QuerySucceeded).ToArray();
+        if (queried.Length == 0) reason = MpoReason.NoSuccessfulQuery;
+        else if (!complete || displays.Any(d => !d.QuerySucceeded || d.CloseStatus != 0 || d.Failure is not null)
+                 || displays.Count(d => d.IsPrimary) != 1) reason = MpoReason.IncompleteEvidence;
         else
         {
-            Console.WriteLine($"MISMATCH: MPO on {mpoDisplay.MonitorName}, but primary is {primaryDisplay?.MonitorName ?? "unknown"}");
-            Console.WriteLine("Run 'mpofix fix' to reassign.");
-        }
-    }
-
-    /// <summary>
-    /// Gets monitor friendly name and primary status via EnumDisplayDevices.
-    /// Matches by DeviceName string instead of index arithmetic.
-    /// Falls back to CCD API for actual EDID monitor name.
-    /// </summary>
-    private static (string monitorName, bool isPrimary) GetMonitorInfo(string gdiDisplayName)
-    {
-        bool isPrimary = false;
-        string monitorName = "Unknown";
-
-        // Enumerate adapters and match by DeviceName
-        var ddAdapter = new DISPLAY_DEVICE();
-        ddAdapter.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
-
-        for (uint i = 0; EnumDisplayDevicesW(null, i, ref ddAdapter, 0); i++)
-        {
-            if (ddAdapter.DeviceName.Equals(gdiDisplayName, StringComparison.OrdinalIgnoreCase))
+            var holder = MpoDetector.GetMpoHolder(displays);
+            if (holder is null) reason = MpoReason.NoActiveHolder;
+            else if (queried.Count(d => d.MaxPlanes == holder.MaxPlanes) > 1) reason = MpoReason.AmbiguousHolder;
+            else
             {
-                isPrimary = (ddAdapter.StateFlags & 0x4) != 0; // DISPLAY_DEVICE_PRIMARY_DEVICE
-                break;
+                reason = MpoReason.ConfirmedHolder;
+                state = holder.IsPrimary ? MpoState.OnPrimary : MpoState.OffPrimary;
             }
         }
-
-        // Use CCD API to get actual EDID monitor name
-        monitorName = GetEdidMonitorName(gdiDisplayName) ?? "Unknown";
-
-        return (monitorName, isPrimary);
+        log.Write("mpo.result", $"state={state}, reason={reason}, queried={queried.Length}/{displays.Count}");
+        return new(state, reason, displays.AsReadOnly());
     }
+}
 
-    /// <summary>
-    /// Uses Windows CCD (QueryDisplayConfig + DisplayConfigGetDeviceInfo) to get EDID monitor name.
-    /// Retries on ERROR_INSUFFICIENT_BUFFER which can occur during topology churn.
-    /// </summary>
-    private static string? GetEdidMonitorName(string gdiDisplayName)
+internal static class MpoDetector
+{
+    private static MpoQuery CreateQuery() => new(new Win32MpoNative(),
+        new TopologyCollector(new Win32CcdNative(), Diagnostics.Sink, new SystemObservationClock()), Diagnostics.Sink);
+
+    internal static List<DisplayMpoInfo> QueryAllDisplays() => CreateQuery().Observe().Displays.ToList();
+    internal static MpoState GetMpoState() => CreateQuery().Observe().State;
+    internal static bool IsMpoOnPrimary() => GetMpoState() == MpoState.OnPrimary;
+
+    internal static DisplayMpoInfo? GetMpoHolder(IReadOnlyList<DisplayMpoInfo> displays) =>
+        displays.Where(d => d.HasMpo).OrderByDescending(d => d.MaxPlanes).FirstOrDefault();
+
+    internal static void PrintStatus() => PrintStatus(CreateQuery().Observe());
+
+    internal static void PrintStatus(MpoObservation observation)
     {
-        const int ERROR_INSUFFICIENT_BUFFER = 122;
-        const int maxRetries = 3;
-
-        DISPLAYCONFIG_PATH_INFO[] paths;
-        DISPLAYCONFIG_MODE_INFO[] modes;
-        uint pathCount, modeCount;
-
-        // Retry loop handles buffer race during display reconfiguration
-        for (int attempt = 0; attempt < maxRetries; attempt++)
-        {
-            pathCount = 0; modeCount = 0;
-            int err = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, ref pathCount, ref modeCount);
-            if (err != 0) return null;
-
-            paths = new DISPLAYCONFIG_PATH_INFO[pathCount];
-            modes = new DISPLAYCONFIG_MODE_INFO[modeCount];
-            err = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
-
-            if (err == 0)
-            {
-                // Success — search for our display
-                for (int i = 0; i < pathCount; i++)
-                {
-                    var sourceName = new DISPLAYCONFIG_SOURCE_DEVICE_NAME();
-                    sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-                    sourceName.header.size = (uint)Marshal.SizeOf<DISPLAYCONFIG_SOURCE_DEVICE_NAME>();
-                    sourceName.header.adapterId = paths[i].sourceInfo.adapterId;
-                    sourceName.header.id = paths[i].sourceInfo.id;
-
-                    if (DisplayConfigGetDeviceInfo(ref sourceName) != 0)
-                        continue;
-
-                    if (!sourceName.viewGdiDeviceName.Equals(gdiDisplayName, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    var targetName = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
-                    targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-                    targetName.header.size = (uint)Marshal.SizeOf<DISPLAYCONFIG_TARGET_DEVICE_NAME>();
-                    targetName.header.adapterId = paths[i].targetInfo.adapterId;
-                    targetName.header.id = paths[i].targetInfo.id;
-
-                    if (DisplayConfigGetDeviceInfo(ref targetName) == 0)
-                        return targetName.monitorFriendlyDeviceName;
-                }
-
-                return null; // Display not found in paths
-            }
-
-            if (err != ERROR_INSUFFICIENT_BUFFER)
-                return null; // Non-retryable error
-
-            Thread.Sleep(50); // Brief pause before retry
-        }
-
-        return null;
-    }
-
-    // --- Win32 Display Config (CCD) interop ---
-
-    private const uint QDC_ONLY_ACTIVE_PATHS = 0x2;
-    private const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
-    private const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
-
-    [DllImport("user32.dll")]
-    private static extern int GetDisplayConfigBufferSizes(uint flags, ref uint numPaths, ref uint numModes);
-
-    [DllImport("user32.dll")]
-    private static extern int QueryDisplayConfig(uint flags, ref uint numPaths,
-        [In, Out] DISPLAYCONFIG_PATH_INFO[] paths, ref uint numModes,
-        [In, Out] DISPLAYCONFIG_MODE_INFO[] modes, IntPtr currentTopologyId);
-
-    [DllImport("user32.dll")]
-    private static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME info);
-
-    [DllImport("user32.dll")]
-    private static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_TARGET_DEVICE_NAME info);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct LUID_CCD { public uint LowPart; public int HighPart; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DISPLAYCONFIG_DEVICE_INFO_HEADER
-    {
-        public uint type;
-        public uint size;
-        public LUID_CCD adapterId;
-        public uint id;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DISPLAYCONFIG_PATH_SOURCE_INFO
-    {
-        public LUID_CCD adapterId;
-        public uint id;
-        public uint modeInfoIdx;
-        public uint statusFlags;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DISPLAYCONFIG_PATH_TARGET_INFO
-    {
-        public LUID_CCD adapterId;
-        public uint id;
-        public uint modeInfoIdx;
-        public uint outputTechnology;
-        public uint rotation;
-        public uint scaling;
-        public DISPLAYCONFIG_RATIONAL refreshRate;
-        public uint scanLineOrdering;
-        public int targetAvailable;
-        public uint statusFlags;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DISPLAYCONFIG_RATIONAL { public uint Numerator; public uint Denominator; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DISPLAYCONFIG_PATH_INFO
-    {
-        public DISPLAYCONFIG_PATH_SOURCE_INFO sourceInfo;
-        public DISPLAYCONFIG_PATH_TARGET_INFO targetInfo;
-        public uint flags;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DISPLAYCONFIG_MODE_INFO
-    {
-        public uint infoType;
-        public uint id;
-        public LUID_CCD adapterId;
-        // Union of source/target mode — we just need enough space
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)]
-        public byte[] modeData;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct DISPLAYCONFIG_SOURCE_DEVICE_NAME
-    {
-        public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
-        public string viewGdiDeviceName;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct DISPLAYCONFIG_TARGET_DEVICE_NAME
-    {
-        public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
-        public uint flags;
-        public uint outputTechnology;
-        public ushort edidManufactureId;
-        public ushort edidProductCodeId;
-        public uint connectorInstance;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
-        public string monitorFriendlyDeviceName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
-        public string monitorDevicePath;
-    }
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern bool EnumDisplayDevicesW(
-        string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct DISPLAY_DEVICE
-    {
-        public int cb;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
-        public string DeviceName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
-        public string DeviceString;
-        public uint StateFlags;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
-        public string DeviceID;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
-        public string DeviceKey;
+        Console.WriteLine($"{"Display",-14} {"Monitor",-20} {"Planes",-7} {"RGB",-5} {"YUV",-5} {"Primary",-9} MPO");
+        foreach (var d in observation.Displays)
+            Console.WriteLine($"{d.DeviceName,-14} {d.MonitorName,-20} {d.MaxPlanes,-7} {d.MaxRGBPlanes,-5} {d.MaxYUVPlanes,-5} {(d.IsPrimary ? "YES" : ""),-9} {(d.QuerySucceeded ? d.HasMpo ? "YES" : "no" : "unknown")} {d.DetectionReason}");
+        Console.WriteLine($"MPO: {observation.State} ({observation.Reason})");
+        if (observation.Reason == MpoReason.NoActiveHolder)
+            Console.WriteLine("No MaxPlanes > 1 holder; this can be idle and does not establish topology loss or displays-not-ready.");
+        if (observation.State == MpoState.OffPrimary)
+            Console.WriteLine("MISMATCH: MPO off primary. Run 'mpofix fix' to reapply current NVIDIA config.");
     }
 }
